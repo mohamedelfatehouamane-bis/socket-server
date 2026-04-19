@@ -1,4 +1,5 @@
 const path = require('path')
+
 try {
   require('dotenv').config({ path: path.resolve(process.cwd(), '.env.local') })
 } catch {}
@@ -17,6 +18,8 @@ const FRONTEND_ORIGIN =
   process.env.CLIENT_URL ||
   'http://localhost:3000'
 
+const INTERNAL_EVENT_SECRET = process.env.SOCKET_INTERNAL_EVENT_SECRET || ''
+
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
 const supabaseServiceRoleKey =
   process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY
@@ -25,7 +28,9 @@ if (!supabaseUrl || !supabaseServiceRoleKey) {
   throw new Error('Missing Supabase ENV')
 }
 
-const db = createClient(supabaseUrl, supabaseServiceRoleKey)
+const db = createClient(supabaseUrl, supabaseServiceRoleKey, {
+  auth: { persistSession: false },
+})
 
 // ================= SERVER =================
 const app = express()
@@ -37,31 +42,42 @@ const io = new Server(server, {
   path: '/socket.io',
   cors: {
     origin: [
-      "http://localhost:3000",
-      "https://www.storeconquerors.com",
-      "https://storeconquerors.com"
+      'http://localhost:3000',
+      'https://www.storeconquerors.com',
+      'https://storeconquerors.com',
     ],
     methods: ['GET', 'POST'],
     credentials: true,
   },
 })
 
-// ================= AUTH (FIXED) =================
+// ================= HELPERS =================
 function getSocketToken(socket) {
   return socket.handshake?.auth?.token || null
 }
 
+// ✅ FIXED BASE64URL DECODER
+function decodeJWT(token) {
+  const base64Url = token.split('.')[1]
+  const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/')
+  const jsonPayload = Buffer.from(base64, 'base64').toString()
+  return JSON.parse(jsonPayload)
+}
+
+// ================= AUTH =================
 io.use((socket, next) => {
   try {
     const token = getSocketToken(socket)
-    if (!token) return next(new Error('Unauthorized'))
 
-    // ✅ decode Supabase token
-    const payload = JSON.parse(
-      Buffer.from(token.split('.')[1], 'base64').toString()
-    )
+    if (!token) {
+      console.log('❌ No token')
+      return next(new Error('Unauthorized'))
+    }
+
+    const payload = decodeJWT(token)
 
     if (!payload?.sub) {
+      console.log('❌ Invalid payload')
       return next(new Error('Unauthorized'))
     }
 
@@ -69,34 +85,38 @@ io.use((socket, next) => {
       id: payload.sub,
       email: payload.email,
       username: payload.user_metadata?.username || 'User',
-      role: payload.role || 'user',
+      role: payload.app_metadata?.role || 'user',
     }
+
+    console.log('✅ Authenticated:', socket.user.id)
 
     next()
   } catch (err) {
-    console.error('Auth error:', err)
+    console.error('❌ Auth error:', err.message)
     next(new Error('Unauthorized'))
   }
 })
 
 // ================= SOCKET =================
 io.on('connection', (socket) => {
-  console.log('User connected:', socket.id)
+  console.log('🔥 Connected:', socket.id)
 
-  // 🔥 USER ROOM
+  // ✅ USER ROOM
   if (socket.user?.id) {
     socket.join(`user_${socket.user.id}`)
-    console.log('Joined:', `user_${socket.user.id}`)
+    console.log('Joined user room:', `user_${socket.user.id}`)
   }
 
-  // 🔥 ADMIN ROOM
+  // ✅ ADMIN ROOM
   if (socket.user?.role === 'admin') {
     socket.join('admin')
+    console.log('Joined admin room')
   }
 
-  // 🔥 JOIN ORDER
+  // ✅ ORDER ROOM
   socket.on('join_order', (orderId) => {
     socket.join(`order_${orderId}`)
+    console.log('Joined order:', orderId)
   })
 
   // 💬 CHAT
@@ -105,36 +125,57 @@ io.on('connection', (socket) => {
   })
 
   socket.on('disconnect', () => {
-    console.log('Disconnected:', socket.id)
+    console.log('❌ Disconnected:', socket.id)
   })
 })
 
-// ================= TOPUP EVENTS =================
-const INTERNAL_EVENT_SECRET = process.env.SOCKET_INTERNAL_EVENT_SECRET || ''
+// ================= TOP-UP EVENTS =================
+app.post('/events/topups', async (req, res) => {
+  try {
+    const secret = req.headers['x-internal-event-secret']
 
-app.post('/events/topups', (req, res) => {
-  const secret = req.headers['x-internal-event-secret']
+    if (INTERNAL_EVENT_SECRET && secret !== INTERNAL_EVENT_SECRET) {
+      return res.status(401).json({ error: 'Unauthorized' })
+    }
 
-  if (INTERNAL_EVENT_SECRET && secret !== INTERNAL_EVENT_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' })
+    const { event, data } = req.body
+
+    if (!data?.userId) {
+      return res.status(400).json({ error: 'Invalid data' })
+    }
+
+    // 🔔 ADMIN: new request
+    if (event === 'topup_request') {
+      io.to('admin').emit('new_topup_request', data)
+
+      // OPTIONAL Telegram
+      try {
+        await telegramService.sendMessage(
+          process.env.TELEGRAM_ADMIN_CHAT_ID,
+          `💰 New Top-up Request\nUser: ${data.username}\nAmount: ${data.amount}`
+        )
+      } catch {}
+    }
+
+    // 🔄 STATUS UPDATE
+    if (event === 'topup_update') {
+      io.to(`user_${data.userId}`).emit('topup_status', data)
+      io.to('admin').emit('topup_status', data)
+
+      // OPTIONAL Telegram
+      try {
+        await telegramService.sendMessage(
+          process.env.TELEGRAM_ADMIN_CHAT_ID,
+          `📊 Top-up Updated\nStatus: ${data.status}\nUser: ${data.username}`
+        )
+      } catch {}
+    }
+
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('Topup event error:', err)
+    res.status(500).json({ error: 'Server error' })
   }
-
-  const { event, data } = req.body
-
-  if (!data?.userId) {
-    return res.status(400).json({ error: 'Invalid data' })
-  }
-
-  if (event === 'topup_request') {
-    io.to('admin').emit('new_topup_request', data)
-  }
-
-  if (event === 'topup_update') {
-    io.to(`user_${data.userId}`).emit('topup_status', data)
-    io.to('admin').emit('topup_status', data)
-  }
-
-  res.json({ ok: true })
 })
 
 // ================= HEALTH =================
@@ -144,5 +185,5 @@ app.get('/health', (req, res) => {
 
 // ================= START =================
 server.listen(PORT, () => {
-  console.log(`Socket server running on port ${PORT}`)
+  console.log(`🚀 Socket server running on port ${PORT}`)
 })
