@@ -1,5 +1,11 @@
 const path = require('path')
-require('dotenv').config({ path: path.resolve(process.cwd(), '.env.local') })
+try {
+  require('dotenv').config({ path: path.resolve(process.cwd(), '.env.local') })
+} catch (error) {
+  if (error?.code !== 'MODULE_NOT_FOUND') {
+    console.warn('dotenv initialization failed:', error)
+  }
+}
 const http = require('http')
 const express = require('express')
 const jwt = require('jsonwebtoken')
