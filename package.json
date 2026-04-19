@@ -3,7 +3,11 @@
   "version": "1.0.0",
   "main": "server/socket.js",
   "scripts": {
-    "start": "node server/socket.js"
+    "start": "node server/socket.js",
+    "dev": "node server/socket.js"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "express": "^4.18.2",
