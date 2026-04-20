@@ -13,7 +13,11 @@ const { Server } = require('socket.io')
 const { createClient } = require('@supabase/supabase-js')
 const { telegramService } = require('./telegram-service')
 
-const PORT = Number(process.env.SOCKET_PORT || 3001)
+const rawPort = process.env.PORT || '3001'
+const PORT = Number(rawPort)
+if (!Number.isFinite(PORT) || PORT <= 0) {
+  throw new Error(`Invalid server port: ${rawPort}`)
+}
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key'
 const FRONTEND_ORIGIN =
   process.env.SOCKET_CORS_ORIGIN || process.env.CLIENT_URL || process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'
@@ -833,6 +837,10 @@ if (typeof presenceSweepTimer.unref === 'function') {
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true, service: 'socket-server' })
+})
+
+app.get('/api/test', (_req, res) => {
+  res.json({ status: 'API working' })
 })
 
 app.post('/events/topups', async (req, res) => {
