@@ -1,3 +1,10 @@
+const cors = require('cors')
+
+const ALLOWED_ORIGINS = [
+  "https://storeconquerors.com",
+  "https://www.storeconquerors.com",
+  "https://store-v2.vercel.app",
+]
 const path = require('path')
 try {
   require('dotenv').config({ path: path.resolve(process.cwd(), '.env.local') })
@@ -57,13 +64,18 @@ const db = createClient(supabaseUrl, supabaseServiceRoleKey, {
 
 const app = express()
 const server = http.createServer(app)
+app.use(cors({
+  origin: ALLOWED_ORIGINS,
+  credentials: true,
+}))
+
 app.use(express.json({ limit: '256kb' }))
 
 const io = new Server(server, {
   path: '/socket.io',
   allowEIO3: true,
   cors: {
-    origin: FRONTEND_ORIGIN,
+    origin: ALLOWED_ORIGINS,
     methods: ['GET', 'POST'],
     allowedHeaders: ['Authorization', 'Content-Type'],
     credentials: true,
