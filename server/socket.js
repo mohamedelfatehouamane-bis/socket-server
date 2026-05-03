@@ -912,7 +912,7 @@ app.post('/telegram/webhook', async (req, res) => {
   try {
     const { data, error } = await db
       .from(TOPUP_REQUESTS_TABLE)
-      .select('id, user_id, amount, status')
+      .select('id, user_id, amount, status, created_at')
       .eq('id', requestId)
       .maybeSingle()
 
@@ -954,7 +954,7 @@ app.post('/telegram/webhook', async (req, res) => {
     userId: topupRequest.user_id,
     amount: topupRequest.amount,
     status: newStatus,
-    created_at: new Date().toISOString(),
+    created_at: topupRequest.created_at ?? new Date().toISOString(),
   }
   emitTopupStatus(statusData)
 
