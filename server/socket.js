@@ -855,6 +855,150 @@ app.get('/api/test', (_req, res) => {
   res.json({ status: 'API working' })
 })
 
+// ---------------------------------------------------------------------------
+// Telegram webhook — handles callback_query from inline keyboard buttons
+// ---------------------------------------------------------------------------
+const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || ''
+const TOPUP_REQUESTS_TABLE = process.env.TOPUP_REQUESTS_TABLE || 'topup_requests'
+
+app.post('/telegram/webhook', async (req, res) => {
+  // Validate the secret token sent by Telegram (if configured)
+  if (TELEGRAM_WEBHOOK_SECRET) {
+    const incoming = String(req.headers['x-telegram-bot-api-secret-token'] || '')
+    if (incoming !== TELEGRAM_WEBHOOK_SECRET) {
+      res.status(403).json({ ok: false })
+      return
+    }
+  }
+
+  // Respond immediately so Telegram doesn't retry
+  res.sendStatus(200)
+
+  const update = req.body
+  const callbackQuery = update?.callback_query
+  if (!callbackQuery) return
+
+  const callbackQueryId = String(callbackQuery.id || '')
+  const callbackData = String(callbackQuery.data || '')
+  const chatId = callbackQuery.message?.chat?.id
+  const messageId = callbackQuery.message?.message_id
+
+  let newStatus
+  let requestId
+  if (callbackData.startsWith('approve_')) {
+    newStatus = 'approved'
+    requestId = callbackData.slice('approve_'.length)
+  } else if (callbackData.startsWith('reject_')) {
+    newStatus = 'rejected'
+    requestId = callbackData.slice('reject_'.length)
+  } else {
+    return
+  }
+
+  if (!requestId) return
+
+  // Answer the callback query to remove the loading spinner on the button
+  try {
+    await telegramService.callTelegram('answerCallbackQuery', {
+      callback_query_id: callbackQueryId,
+      text: newStatus === 'approved' ? '✅ Approved!' : '❌ Rejected!',
+    })
+  } catch (err) {
+    console.error('[TelegramWebhook] answerCallbackQuery failed:', err)
+  }
+
+  // Fetch the topup request from the database
+  let topupRequest
+  try {
+    const { data, error } = await db
+      .from(TOPUP_REQUESTS_TABLE)
+      .select('id, user_id, amount, status, created_at')
+      .eq('id', requestId)
+      .maybeSingle()
+
+    if (error || !data) {
+      console.error('[TelegramWebhook] topup request not found:', requestId, error)
+      return
+    }
+    topupRequest = data
+  } catch (err) {
+    console.error('[TelegramWebhook] DB fetch error:', err)
+    return
+  }
+
+  // Skip if already processed
+  if (topupRequest.status === 'approved' || topupRequest.status === 'rejected') {
+    console.log('[TelegramWebhook] Request already processed:', requestId, topupRequest.status)
+    return
+  }
+
+  // Update the status in the database
+  try {
+    const { error: updateError } = await db
+      .from(TOPUP_REQUESTS_TABLE)
+      .update({ status: newStatus })
+      .eq('id', requestId)
+
+    if (updateError) {
+      console.error('[TelegramWebhook] Failed to update topup status:', updateError)
+      return
+    }
+  } catch (err) {
+    console.error('[TelegramWebhook] DB update error:', err)
+    return
+  }
+
+  // Notify connected clients via socket
+  const statusData = {
+    requestId,
+    userId: topupRequest.user_id,
+    amount: topupRequest.amount,
+    status: newStatus,
+    created_at: topupRequest.created_at ?? new Date().toISOString(),
+  }
+  emitTopupStatus(statusData)
+
+  // Edit the original Telegram message to remove the buttons and show the outcome
+  if (chatId && messageId) {
+    try {
+      const updatedText =
+        formatTopupAdminTelegramMessage({
+          requestId,
+          userId: topupRequest.user_id,
+          amount: topupRequest.amount,
+          status: newStatus,
+        }) +
+        '\n\n' +
+        (newStatus === 'approved' ? '✅ <b>Approved</b>' : '❌ <b>Rejected</b>')
+
+      await telegramService.callTelegram('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        text: updatedText,
+        parse_mode: 'HTML',
+      })
+    } catch (err) {
+      // Non-fatal: message may have already been edited or deleted
+      console.error('[TelegramWebhook] editMessageText failed:', err)
+    }
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Register Telegram webhook URL on startup (when TELEGRAM_WEBHOOK_URL is set)
+// ---------------------------------------------------------------------------
+const TELEGRAM_WEBHOOK_URL = process.env.TELEGRAM_WEBHOOK_URL || ''
+if (TELEGRAM_WEBHOOK_URL) {
+  const webhookPayload = { url: TELEGRAM_WEBHOOK_URL }
+  if (TELEGRAM_WEBHOOK_SECRET) {
+    webhookPayload.secret_token = TELEGRAM_WEBHOOK_SECRET
+  }
+  telegramService
+    .callTelegram('setWebhook', webhookPayload)
+    .then(() => console.log('[Telegram] Webhook registered:', TELEGRAM_WEBHOOK_URL))
+    .catch((err) => console.error('[Telegram] Failed to register webhook:', err))
+}
+
 app.post('/events/topups', async (req, res) => {
   try {
     const incomingSecret = String(req.headers['x-internal-event-secret'] || '')
