@@ -254,7 +254,7 @@ async function isSellerAssignedToCategory(sellerId, categoryId) {
     return false
   }
 
-  return Boolean(data?.id)
+  return data !== null
 }
 
 async function getAuthorizedOrder(orderId, user) {
