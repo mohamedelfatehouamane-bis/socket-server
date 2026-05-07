@@ -86,6 +86,53 @@ const INTERNAL_EVENT_SECRET = process.env.SOCKET_INTERNAL_EVENT_SECRET || ''
 const ADMIN_TELEGRAM_CHAT_ID = process.env.ADMIN_TELEGRAM_ID || process.env.TELEGRAM_ADMIN_CHAT_ID || ''
 const TOPUP_STATUSES = new Set(['pending', 'processing', 'approved', 'rejected'])
 
+// ---------------------------------------------------------------------------
+// Room name helpers — centralised so naming stays consistent everywhere.
+// ---------------------------------------------------------------------------
+const ROOM = {
+  user: (id) => `user:${id}`,
+  role: (role) => `role:${role}`,
+  seller: (id) => `seller:${id}`,
+  customer: (id) => `customer:${id}`,
+  admins: 'admins',
+  order: (id) => `order_${id}`, // order-chat rooms keep underscore for chat events
+}
+
+// ---------------------------------------------------------------------------
+// Standardised event name constants
+// ---------------------------------------------------------------------------
+const EVENTS = {
+  // Order lifecycle
+  ORDER_CREATED: 'ORDER_CREATED',
+  ORDER_ASSIGNED: 'ORDER_ASSIGNED',
+  ORDER_ACCEPTED: 'ORDER_ACCEPTED',
+  ORDER_REJECTED: 'ORDER_REJECTED',
+  ORDER_COMPLETED: 'ORDER_COMPLETED',
+  ORDER_CANCELLED: 'ORDER_CANCELLED',
+  ORDER_STATUS_UPDATED: 'ORDER_STATUS_UPDATED',
+  NEW_MESSAGE: 'NEW_MESSAGE',
+  // Withdrawal
+  WITHDRAWAL_CREATED: 'WITHDRAWAL_CREATED',
+  WITHDRAWAL_APPROVED: 'WITHDRAWAL_APPROVED',
+  WITHDRAWAL_REJECTED: 'WITHDRAWAL_REJECTED',
+  // Topup
+  NEW_TOPUP_REQUEST: 'NEW_TOPUP_REQUEST',
+  TOPUP_STATUS_UPDATED: 'TOPUP_STATUS_UPDATED',
+  // Error
+  SOCKET_ERROR: 'SOCKET_ERROR',
+}
+
+/**
+ * Emit a structured error to a specific user room.
+ * @param {string} userId
+ * @param {string} code
+ * @param {string} message
+ * @param {object} [extra]
+ */
+function emitSocketError(userId, code, message, extra = {}) {
+  io.to(ROOM.user(userId)).emit(EVENTS.SOCKET_ERROR, { code, message, ...extra })
+}
+
 function escapeHtml(value) {
   return String(value ?? '')
     .replace(/&/g, '&amp;')
@@ -106,7 +153,9 @@ function formatTopupAdminTelegramMessage(data) {
 }
 
 async function emitTopupRequest(data) {
-  io.to('admin').emit('new_topup_request', data)
+  io.to(ROOM.admins).emit(EVENTS.NEW_TOPUP_REQUEST, data)
+  // Legacy event name for backward compatibility
+  io.to(ROOM.admins).emit('new_topup_request', data)
 
   if (!ADMIN_TELEGRAM_CHAT_ID) {
     return
@@ -129,9 +178,12 @@ async function emitTopupRequest(data) {
 }
 
 function emitTopupStatus(data) {
-  console.log('Sending to:', `user_${data.userId}`)
-  io.to(`user_${data.userId}`).emit('topup_status', data)
-  io.to('admin').emit('topup_status', data)
+  console.log('Sending to:', ROOM.user(data.userId))
+  io.to(ROOM.user(data.userId)).emit(EVENTS.TOPUP_STATUS_UPDATED, data)
+  io.to(ROOM.admins).emit(EVENTS.TOPUP_STATUS_UPDATED, data)
+  // Legacy event names for backward compatibility
+  io.to(ROOM.user(data.userId)).emit('topup_status', data)
+  io.to(ROOM.admins).emit('topup_status', data)
 }
 
 function normalizeTopupPayload(input) {
@@ -460,14 +512,29 @@ io.on('connection', (socket) => {
   /** @type {Set<string>} order IDs this socket has joined */
   socket.joinedOrderIds = new Set()
 
-  if (socket.user?.id) {
-    socket.join(`user_${socket.user.id}`)
-    console.log('Joined room:', `user_${socket.user.id}`)
-  }
+  const user = socket.user
+  if (user?.id) {
+    // Universal user room
+    socket.join(ROOM.user(user.id))
+    console.log('Joined room:', ROOM.user(user.id))
 
-  if (socket.user?.role === 'admin') {
-    socket.join('admin')
-    console.log('Joined room:', 'admin')
+    // Role room
+    if (user.role) {
+      socket.join(ROOM.role(user.role))
+      console.log('Joined room:', ROOM.role(user.role))
+    }
+
+    // Role-specific rooms
+    if (user.role === 'admin') {
+      socket.join(ROOM.admins)
+      console.log('Joined room:', ROOM.admins)
+    } else if (user.role === 'seller') {
+      socket.join(ROOM.seller(user.id))
+      console.log('Joined room:', ROOM.seller(user.id))
+    } else if (user.role === 'customer') {
+      socket.join(ROOM.customer(user.id))
+      console.log('Joined room:', ROOM.customer(user.id))
+    }
   }
 
   socket.on('topup_request', async (payload, ack) => {
@@ -615,7 +682,7 @@ io.on('connection', (socket) => {
       }
 
       io.to(`order_${orderId}`).emit('order_action', eventPayload)
-      io.to('admin').emit('order_action', eventPayload)
+      io.to(ROOM.admins).emit('order_action', eventPayload)
 
       ack?.({ success: true })
     } catch (error) {
@@ -883,6 +950,21 @@ app.post('/telegram/webhook', async (req, res) => {
   const chatId = callbackQuery.message?.chat?.id
   const messageId = callbackQuery.message?.message_id
 
+  // ---------------------------------------------------------------------------
+  // Order action callbacks: accept_order_<id>, reject_order_<id>, complete_order_<id>
+  // ---------------------------------------------------------------------------
+  if (
+    callbackData.startsWith('accept_order_') ||
+    callbackData.startsWith('reject_order_') ||
+    callbackData.startsWith('complete_order_')
+  ) {
+    await handleOrderCallbackQuery({ callbackQueryId, callbackData, chatId, messageId })
+    return
+  }
+
+  // ---------------------------------------------------------------------------
+  // Topup action callbacks: approve_<id>, reject_<id>
+  // ---------------------------------------------------------------------------
   let newStatus
   let requestId
   if (callbackData.startsWith('approve_')) {
@@ -985,6 +1067,227 @@ app.post('/telegram/webhook', async (req, res) => {
 })
 
 // ---------------------------------------------------------------------------
+// Handle order action callback queries from Telegram inline buttons.
+// Validates seller identity, validates order state, updates DB atomically,
+// and emits the appropriate socket event to the relevant rooms.
+// ---------------------------------------------------------------------------
+async function handleOrderCallbackQuery({ callbackQueryId, callbackData, chatId, messageId }) {
+  // Parse action and orderId from callback data
+  let action
+  let orderId
+  if (callbackData.startsWith('accept_order_')) {
+    action = 'accept'
+    orderId = callbackData.slice('accept_order_'.length)
+  } else if (callbackData.startsWith('reject_order_')) {
+    action = 'reject'
+    orderId = callbackData.slice('reject_order_'.length)
+  } else if (callbackData.startsWith('complete_order_')) {
+    action = 'complete'
+    orderId = callbackData.slice('complete_order_'.length)
+  } else {
+    return
+  }
+
+  if (!orderId) {
+    await answerCallbackQuerySafe(callbackQueryId, '❌ Invalid order ID')
+    return
+  }
+
+  // Identify seller by their Telegram chat ID
+  let seller
+  try {
+    const { data, error } = await db
+      .from('users')
+      .select('id, role, telegram_id')
+      .eq('telegram_id', String(chatId))
+      .eq('role', 'seller')
+      .maybeSingle()
+
+    if (error || !data) {
+      console.error('[TelegramOrderCallback] Seller not found for chatId:', chatId, error)
+      await answerCallbackQuerySafe(callbackQueryId, '❌ Seller account not found')
+      return
+    }
+    seller = data
+  } catch (err) {
+    console.error('[TelegramOrderCallback] DB error fetching seller:', err)
+    await answerCallbackQuerySafe(callbackQueryId, '❌ Server error')
+    return
+  }
+
+  // Fetch the order
+  let order
+  try {
+    const { data, error } = await db
+      .from('orders')
+      .select('id, status, customer_id, assigned_seller_id, category_id')
+      .eq('id', orderId)
+      .maybeSingle()
+
+    if (error || !data) {
+      console.error('[TelegramOrderCallback] Order not found:', orderId, error)
+      await answerCallbackQuerySafe(callbackQueryId, '❌ Order not found')
+      return
+    }
+    order = data
+  } catch (err) {
+    console.error('[TelegramOrderCallback] DB error fetching order:', err)
+    await answerCallbackQuerySafe(callbackQueryId, '❌ Server error')
+    return
+  }
+
+  // Validate seller has permission for this action
+  const isAssigned = order.assigned_seller_id === seller.id
+  const isEligible = isAssigned || order.assigned_seller_id === null
+
+  if (action === 'accept') {
+    if (order.status !== 'pending') {
+      await answerCallbackQuerySafe(callbackQueryId, '⚠️ Order is no longer pending')
+      return
+    }
+    if (!isEligible) {
+      await answerCallbackQuerySafe(callbackQueryId, '❌ Not authorised for this order')
+      return
+    }
+  } else if (action === 'reject') {
+    if (!['pending', 'in_progress'].includes(order.status)) {
+      await answerCallbackQuerySafe(callbackQueryId, '⚠️ Order cannot be rejected at this stage')
+      return
+    }
+    if (!isAssigned && order.assigned_seller_id !== null) {
+      await answerCallbackQuerySafe(callbackQueryId, '❌ Not authorised for this order')
+      return
+    }
+  } else if (action === 'complete') {
+    if (order.status !== 'in_progress') {
+      await answerCallbackQuerySafe(callbackQueryId, '⚠️ Order is not in progress')
+      return
+    }
+    if (!isAssigned) {
+      await answerCallbackQuerySafe(callbackQueryId, '❌ Not authorised for this order')
+      return
+    }
+  }
+
+  // Determine new status and update fields
+  let newOrderStatus
+  let updateFields
+  if (action === 'accept') {
+    newOrderStatus = 'in_progress'
+    updateFields = { status: newOrderStatus, assigned_seller_id: seller.id }
+  } else if (action === 'reject') {
+    newOrderStatus = 'rejected'
+    updateFields = { status: newOrderStatus }
+  } else {
+    newOrderStatus = 'completed'
+    updateFields = { status: newOrderStatus }
+  }
+
+  // Atomic DB update with optimistic lock using the order status we read earlier.
+  // This prevents race conditions: if the status changed between our read and
+  // update, the row will not match and the update is a no-op (0 rows affected).
+  try {
+    const { error: updateError } = await db
+      .from('orders')
+      .update(updateFields)
+      .eq('id', orderId)
+      .eq('status', order.status)
+
+    if (updateError) {
+      console.error('[TelegramOrderCallback] DB update failed:', updateError)
+      await answerCallbackQuerySafe(callbackQueryId, '❌ Failed to update order')
+      return
+    }
+  } catch (err) {
+    console.error('[TelegramOrderCallback] DB update error:', err)
+    await answerCallbackQuerySafe(callbackQueryId, '❌ Server error')
+    return
+  }
+
+  // Answer the callback query (removes loading spinner)
+  let ackText
+  if (action === 'accept') {
+    ackText = '✅ Order accepted!'
+  } else if (action === 'reject') {
+    ackText = '❌ Order rejected'
+  } else {
+    ackText = '✅ Order completed!'
+  }
+  await answerCallbackQuerySafe(callbackQueryId, ackText)
+
+  // Build event payload
+  const eventPayload = {
+    orderId,
+    customerId: order.customer_id,
+    sellerId: seller.id,
+    status: newOrderStatus,
+    timestamp: new Date().toISOString(),
+    source: 'telegram',
+  }
+
+  // Emit socket events to the relevant rooms
+  if (action === 'accept') {
+    io.to(ROOM.user(order.customer_id)).emit(EVENTS.ORDER_ACCEPTED, eventPayload)
+    io.to(ROOM.seller(seller.id)).emit(EVENTS.ORDER_ACCEPTED, eventPayload)
+    io.to(ROOM.admins).emit(EVENTS.ORDER_ACCEPTED, eventPayload)
+    io.to(ROOM.admins).emit(EVENTS.ORDER_STATUS_UPDATED, eventPayload)
+    io.to(ROOM.user(order.customer_id)).emit(EVENTS.ORDER_STATUS_UPDATED, eventPayload)
+  } else if (action === 'reject') {
+    io.to(ROOM.user(order.customer_id)).emit(EVENTS.ORDER_REJECTED, eventPayload)
+    io.to(ROOM.admins).emit(EVENTS.ORDER_REJECTED, eventPayload)
+    io.to(ROOM.admins).emit(EVENTS.ORDER_STATUS_UPDATED, eventPayload)
+    io.to(ROOM.user(order.customer_id)).emit(EVENTS.ORDER_STATUS_UPDATED, eventPayload)
+  } else {
+    io.to(ROOM.user(order.customer_id)).emit(EVENTS.ORDER_COMPLETED, eventPayload)
+    io.to(ROOM.seller(seller.id)).emit(EVENTS.ORDER_COMPLETED, eventPayload)
+    io.to(ROOM.admins).emit(EVENTS.ORDER_COMPLETED, eventPayload)
+    io.to(ROOM.admins).emit(EVENTS.ORDER_STATUS_UPDATED, eventPayload)
+    io.to(ROOM.user(order.customer_id)).emit(EVENTS.ORDER_STATUS_UPDATED, eventPayload)
+  }
+
+  console.log(`[TelegramOrderCallback] order=${orderId} action=${action} seller=${seller.id} newStatus=${newOrderStatus}`)
+
+  // Edit the original Telegram message to remove the buttons and reflect the new state
+  if (chatId && messageId) {
+    let statusLine
+    if (action === 'accept') {
+      statusLine = '✅ <b>Accepted — now in progress</b>'
+    } else if (action === 'reject') {
+      statusLine = '❌ <b>Rejected</b>'
+    } else {
+      statusLine = '✅ <b>Completed</b>'
+    }
+    try {
+      await telegramService.callTelegram('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        text: `📦 <b>Order #${escapeHtml(orderId)}</b>\n\n${statusLine}`,
+        parse_mode: 'HTML',
+      })
+    } catch (err) {
+      console.error('[TelegramOrderCallback] editMessageText failed:', err)
+    }
+  }
+}
+
+/**
+ * Safely answer a Telegram callback query without throwing.
+ * @param {string} callbackQueryId
+ * @param {string} text
+ */
+async function answerCallbackQuerySafe(callbackQueryId, text) {
+  if (!callbackQueryId) return
+  try {
+    await telegramService.callTelegram('answerCallbackQuery', {
+      callback_query_id: callbackQueryId,
+      text,
+    })
+  } catch (err) {
+    console.error('[TelegramWebhook] answerCallbackQuery failed:', err)
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Register Telegram webhook URL on startup (when TELEGRAM_WEBHOOK_URL is set)
 // ---------------------------------------------------------------------------
 const TELEGRAM_WEBHOOK_URL = process.env.TELEGRAM_WEBHOOK_URL || ''
@@ -1014,13 +1317,13 @@ app.post('/events/topups', async (req, res) => {
       return
     }
 
-    if (event === 'topup_request') {
+    if (event === 'topup_request' || event === EVENTS.NEW_TOPUP_REQUEST) {
       await emitTopupRequest(data)
       res.json({ success: true })
       return
     }
 
-    if (event === 'topup_update') {
+    if (event === 'topup_update' || event === EVENTS.TOPUP_STATUS_UPDATED) {
       emitTopupStatus(data)
       res.json({ success: true })
       return
@@ -1030,6 +1333,227 @@ app.post('/events/topups', async (req, res) => {
   } catch (error) {
     console.error('Internal top-up event error:', error)
     res.status(500).json({ success: false, error: 'Unable to process top-up event' })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Internal order events endpoint — called by the main Next.js backend when
+// order state changes.  Never exposed to the public.
+//
+// POST /events/orders
+// Body: { event: string, data: object }
+//
+// Supported events:
+//   ORDER_CREATED  — data: { orderId, customerId, eligibleSellerIds[], categoryId?, ... }
+//   ORDER_ASSIGNED — data: { orderId, customerId, sellerId, ... }
+//   ORDER_ACCEPTED — data: { orderId, customerId, sellerId, ... }
+//   ORDER_REJECTED — data: { orderId, customerId, sellerId?, ... }
+//   ORDER_COMPLETED — data: { orderId, customerId, sellerId, ... }
+//   ORDER_CANCELLED — data: { orderId, customerId, sellerId?, ... }
+//   ORDER_STATUS_UPDATED — data: { orderId, customerId, sellerId?, status, ... }
+//   NEW_MESSAGE — data: { orderId, customerId, sellerId, message, ... }
+// ---------------------------------------------------------------------------
+app.post('/events/orders', (req, res) => {
+  try {
+    const incomingSecret = String(req.headers['x-internal-event-secret'] || '')
+    if (INTERNAL_EVENT_SECRET && incomingSecret !== INTERNAL_EVENT_SECRET) {
+      res.status(401).json({ success: false, error: 'Unauthorized internal event' })
+      return
+    }
+
+    const event = String(req.body?.event || '').trim()
+    const data = req.body?.data
+
+    if (!event || !data || typeof data !== 'object') {
+      res.status(400).json({ success: false, error: 'Missing event or data' })
+      return
+    }
+
+    const orderId = String(data.orderId || '').trim()
+    const customerId = String(data.customerId || '').trim()
+    const sellerId = String(data.sellerId || '').trim()
+
+    if (!orderId) {
+      res.status(400).json({ success: false, error: 'Missing orderId' })
+      return
+    }
+
+    const payload = { ...data, timestamp: new Date().toISOString() }
+
+    switch (event) {
+      case EVENTS.ORDER_CREATED: {
+        // Notify admins (ROOM.admins covers all admin users)
+        io.to(ROOM.admins).emit(EVENTS.ORDER_CREATED, payload)
+        // Notify eligible sellers
+        const eligibleSellerIds = Array.isArray(data.eligibleSellerIds) ? data.eligibleSellerIds : []
+        for (const sid of eligibleSellerIds) {
+          io.to(ROOM.seller(String(sid))).emit(EVENTS.ORDER_CREATED, payload)
+          io.to(ROOM.user(String(sid))).emit(EVENTS.ORDER_CREATED, payload)
+        }
+        break
+      }
+
+      case EVENTS.ORDER_ASSIGNED: {
+        if (sellerId) {
+          io.to(ROOM.seller(sellerId)).emit(EVENTS.ORDER_ASSIGNED, payload)
+          io.to(ROOM.user(sellerId)).emit(EVENTS.ORDER_ASSIGNED, payload)
+        }
+        if (customerId) {
+          io.to(ROOM.customer(customerId)).emit(EVENTS.ORDER_ASSIGNED, payload)
+          io.to(ROOM.user(customerId)).emit(EVENTS.ORDER_ASSIGNED, payload)
+        }
+        io.to(ROOM.admins).emit(EVENTS.ORDER_ASSIGNED, payload)
+        break
+      }
+
+      case EVENTS.ORDER_ACCEPTED: {
+        if (customerId) {
+          io.to(ROOM.user(customerId)).emit(EVENTS.ORDER_ACCEPTED, payload)
+          io.to(ROOM.user(customerId)).emit(EVENTS.ORDER_STATUS_UPDATED, payload)
+        }
+        io.to(ROOM.admins).emit(EVENTS.ORDER_ACCEPTED, payload)
+        io.to(ROOM.admins).emit(EVENTS.ORDER_STATUS_UPDATED, payload)
+        break
+      }
+
+      case EVENTS.ORDER_REJECTED: {
+        if (customerId) {
+          io.to(ROOM.user(customerId)).emit(EVENTS.ORDER_REJECTED, payload)
+          io.to(ROOM.user(customerId)).emit(EVENTS.ORDER_STATUS_UPDATED, payload)
+        }
+        io.to(ROOM.admins).emit(EVENTS.ORDER_REJECTED, payload)
+        io.to(ROOM.admins).emit(EVENTS.ORDER_STATUS_UPDATED, payload)
+        break
+      }
+
+      case EVENTS.ORDER_COMPLETED: {
+        if (customerId) {
+          io.to(ROOM.user(customerId)).emit(EVENTS.ORDER_COMPLETED, payload)
+          io.to(ROOM.user(customerId)).emit(EVENTS.ORDER_STATUS_UPDATED, payload)
+        }
+        if (sellerId) {
+          io.to(ROOM.seller(sellerId)).emit(EVENTS.ORDER_COMPLETED, payload)
+          io.to(ROOM.user(sellerId)).emit(EVENTS.ORDER_COMPLETED, payload)
+        }
+        io.to(ROOM.admins).emit(EVENTS.ORDER_COMPLETED, payload)
+        io.to(ROOM.admins).emit(EVENTS.ORDER_STATUS_UPDATED, payload)
+        break
+      }
+
+      case EVENTS.ORDER_CANCELLED: {
+        if (customerId) {
+          io.to(ROOM.user(customerId)).emit(EVENTS.ORDER_CANCELLED, payload)
+          io.to(ROOM.user(customerId)).emit(EVENTS.ORDER_STATUS_UPDATED, payload)
+        }
+        if (sellerId) {
+          io.to(ROOM.seller(sellerId)).emit(EVENTS.ORDER_CANCELLED, payload)
+          io.to(ROOM.user(sellerId)).emit(EVENTS.ORDER_CANCELLED, payload)
+        }
+        io.to(ROOM.admins).emit(EVENTS.ORDER_CANCELLED, payload)
+        io.to(ROOM.admins).emit(EVENTS.ORDER_STATUS_UPDATED, payload)
+        break
+      }
+
+      case EVENTS.ORDER_STATUS_UPDATED: {
+        if (customerId) {
+          io.to(ROOM.user(customerId)).emit(EVENTS.ORDER_STATUS_UPDATED, payload)
+        }
+        if (sellerId) {
+          io.to(ROOM.user(sellerId)).emit(EVENTS.ORDER_STATUS_UPDATED, payload)
+        }
+        io.to(ROOM.admins).emit(EVENTS.ORDER_STATUS_UPDATED, payload)
+        break
+      }
+
+      case EVENTS.NEW_MESSAGE: {
+        // Only emit to users directly involved in the order
+        if (customerId) {
+          io.to(ROOM.user(customerId)).emit(EVENTS.NEW_MESSAGE, payload)
+        }
+        if (sellerId) {
+          io.to(ROOM.user(sellerId)).emit(EVENTS.NEW_MESSAGE, payload)
+        }
+        io.to(ROOM.admins).emit(EVENTS.NEW_MESSAGE, payload)
+        break
+      }
+
+      default:
+        res.status(400).json({ success: false, error: `Unsupported order event: ${event}` })
+        return
+    }
+
+    console.log(`[/events/orders] event=${event} orderId=${orderId}`)
+    res.json({ success: true })
+  } catch (error) {
+    console.error('Internal order event error:', error)
+    res.status(500).json({ success: false, error: 'Unable to process order event' })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Internal withdrawal events endpoint — called by the main Next.js backend.
+//
+// POST /events/withdrawals
+// Body: { event: string, data: object }
+//
+// Supported events:
+//   WITHDRAWAL_CREATED  — data: { withdrawalId, sellerId, amount, status, ... }
+//   WITHDRAWAL_APPROVED — data: { withdrawalId, sellerId, amount, ... }
+//   WITHDRAWAL_REJECTED — data: { withdrawalId, sellerId, amount, reason?, ... }
+// ---------------------------------------------------------------------------
+app.post('/events/withdrawals', (req, res) => {
+  try {
+    const incomingSecret = String(req.headers['x-internal-event-secret'] || '')
+    if (INTERNAL_EVENT_SECRET && incomingSecret !== INTERNAL_EVENT_SECRET) {
+      res.status(401).json({ success: false, error: 'Unauthorized internal event' })
+      return
+    }
+
+    const event = String(req.body?.event || '').trim()
+    const data = req.body?.data
+
+    if (!event || !data || typeof data !== 'object') {
+      res.status(400).json({ success: false, error: 'Missing event or data' })
+      return
+    }
+
+    const sellerId = String(data.sellerId || '').trim()
+    if (!sellerId) {
+      res.status(400).json({ success: false, error: 'Missing sellerId' })
+      return
+    }
+
+    const payload = { ...data, timestamp: new Date().toISOString() }
+
+    switch (event) {
+      case EVENTS.WITHDRAWAL_CREATED:
+        io.to(ROOM.admins).emit(EVENTS.WITHDRAWAL_CREATED, payload)
+        io.to(ROOM.seller(sellerId)).emit(EVENTS.WITHDRAWAL_CREATED, payload)
+        io.to(ROOM.user(sellerId)).emit(EVENTS.WITHDRAWAL_CREATED, payload)
+        break
+
+      case EVENTS.WITHDRAWAL_APPROVED:
+        io.to(ROOM.seller(sellerId)).emit(EVENTS.WITHDRAWAL_APPROVED, payload)
+        io.to(ROOM.user(sellerId)).emit(EVENTS.WITHDRAWAL_APPROVED, payload)
+        io.to(ROOM.admins).emit(EVENTS.WITHDRAWAL_APPROVED, payload)
+        break
+
+      case EVENTS.WITHDRAWAL_REJECTED:
+        io.to(ROOM.seller(sellerId)).emit(EVENTS.WITHDRAWAL_REJECTED, payload)
+        io.to(ROOM.user(sellerId)).emit(EVENTS.WITHDRAWAL_REJECTED, payload)
+        io.to(ROOM.admins).emit(EVENTS.WITHDRAWAL_REJECTED, payload)
+        break
+
+      default:
+        res.status(400).json({ success: false, error: `Unsupported withdrawal event: ${event}` })
+        return
+    }
+
+    console.log(`[/events/withdrawals] event=${event} sellerId=${sellerId}`)
+    res.json({ success: true })
+  } catch (error) {
+    console.error('Internal withdrawal event error:', error)
+    res.status(500).json({ success: false, error: 'Unable to process withdrawal event' })
   }
 })
 
