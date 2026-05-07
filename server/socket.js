@@ -1170,9 +1170,8 @@ async function handleOrderCallbackQuery({ callbackQueryId, callbackData, chatId,
   if (!isAssigned && !order.category_id) {
     console.warn(`[TelegramOrderCallback] Order is missing category_id: ${orderId}`)
   }
-  const hasCategoryAssignment = isAssigned
-    ? true
-    : await isSellerAssignedToCategory(seller.id, order.category_id)
+  const hasCategoryAssignment =
+    isAssigned || (await isSellerAssignedToCategory(seller.id, order.category_id))
   const isEligible = isAssigned || (order.assigned_seller_id === null && hasCategoryAssignment)
 
   if (action === 'accept') {
