@@ -239,6 +239,7 @@ function getSocketToken(socket) {
 
 async function isSellerAssignedToCategory(sellerId, categoryId) {
   if (!sellerId || !categoryId) {
+    console.warn('[SellerCategoryAccess] Missing sellerId or categoryId for assignment check')
     return false
   }
 
