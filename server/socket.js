@@ -237,10 +237,30 @@ function getSocketToken(socket) {
   return null
 }
 
+async function isSellerAssignedToCategory(sellerId, categoryId) {
+  if (!sellerId || !categoryId) {
+    return false
+  }
+
+  const { data, error } = await db
+    .from('seller_categories')
+    .select('id')
+    .eq('seller_id', sellerId)
+    .eq('category_id', categoryId)
+    .maybeSingle()
+
+  if (error) {
+    console.error('[SellerCategoryAccess] Failed to verify assignment:', error)
+    return false
+  }
+
+  return Boolean(data?.id)
+}
+
 async function getAuthorizedOrder(orderId, user) {
   const { data: order, error } = await db
     .from('orders')
-    .select('id, customer_id, assigned_seller_id')
+    .select('id, customer_id, assigned_seller_id, category_id')
     .eq('id', orderId)
     .single()
 
@@ -248,8 +268,12 @@ async function getAuthorizedOrder(orderId, user) {
     return { ok: false, error: 'Order not found' }
   }
 
-  const canAccess =
+  let canAccess =
     user?.role === 'admin' || order.customer_id === user?.id || order.assigned_seller_id === user?.id
+
+  if (!canAccess && user?.role === 'seller' && order.assigned_seller_id === null) {
+    canAccess = await isSellerAssignedToCategory(user.id, order.category_id)
+  }
 
   if (!canAccess) {
     return { ok: false, error: 'Unauthorized' }
@@ -1138,7 +1162,8 @@ async function handleOrderCallbackQuery({ callbackQueryId, callbackData, chatId,
 
   // Validate seller has permission for this action
   const isAssigned = order.assigned_seller_id === seller.id
-  const isEligible = isAssigned || order.assigned_seller_id === null
+  const hasCategoryAssignment = await isSellerAssignedToCategory(seller.id, order.category_id)
+  const isEligible = isAssigned || (order.assigned_seller_id === null && hasCategoryAssignment)
 
   if (action === 'accept') {
     if (order.status !== 'pending') {
