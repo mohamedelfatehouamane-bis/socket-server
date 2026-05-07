@@ -273,7 +273,11 @@ async function getAuthorizedOrder(orderId, user) {
     user?.role === 'admin' || order.customer_id === user?.id || order.assigned_seller_id === user?.id
 
   if (!canAccess && user?.role === 'seller' && order.assigned_seller_id === null) {
-    canAccess = await isSellerAssignedToCategory(user.id, order.category_id)
+    if (!order.category_id) {
+      console.warn(`[OrderAccess] Unassigned order is missing category_id: ${orderId}`)
+    } else {
+      canAccess = await isSellerAssignedToCategory(user.id, order.category_id)
+    }
   }
 
   if (!canAccess) {
@@ -1163,7 +1167,12 @@ async function handleOrderCallbackQuery({ callbackQueryId, callbackData, chatId,
 
   // Validate seller has permission for this action
   const isAssigned = order.assigned_seller_id === seller.id
-  const hasCategoryAssignment = await isSellerAssignedToCategory(seller.id, order.category_id)
+  if (!isAssigned && !order.category_id) {
+    console.warn(`[TelegramOrderCallback] Order is missing category_id: ${orderId}`)
+  }
+  const hasCategoryAssignment = isAssigned
+    ? true
+    : await isSellerAssignedToCategory(seller.id, order.category_id)
   const isEligible = isAssigned || (order.assigned_seller_id === null && hasCategoryAssignment)
 
   if (action === 'accept') {
